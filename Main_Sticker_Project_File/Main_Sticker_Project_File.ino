@@ -31,6 +31,7 @@ const int switchPin = 5;
 // Vibration sensor pin (for playback)
 const int vibrationPin = 4;  
 
+const int speakerPowerPin = 13;
 // Calculate total samples for RECORD_SECONDS at SAMPLE_RATE
 static const size_t TOTAL_SAMPLES = SAMPLE_RATE * RECORD_SECONDS;
 
@@ -110,6 +111,8 @@ void setup() {
 
   // Configure pins
   pinMode(switchPin, INPUT_PULLUP);
+  pinMode(speakerPowerPin, OUTPUT); // Set the pin as an output
+
   pinMode(vibrationPin, INPUT_PULLUP); // SW420 typically uses a simple digital pin
   attachInterrupt(digitalPinToInterrupt(vibrationPin), vibrationISR, FALLING);  // Detect LOW signal
 
@@ -177,9 +180,30 @@ void loop() {
     Serial.println("Recording finished.");
     delay(500); // Small pause
   }
+
+
+
   // 2. Check vibration sensor -> Playback
   if (vibrationDetected && recordedSize > 0) {
     Serial.println("Vibration detected, starting playback...");
+    // Turn on speaker module
+    digitalWrite(speakerPowerPin, HIGH); // Set the pin high
+    delay(100);
+
+  // Ensure previous I2S driver is stopped and reset
+  i2s_driver_uninstall(I2S_NUM_1);
+  delay(50);
+  setupI2SSpeaker(); // Reinitialize I2S for speaker
+
+  // Flush I2S to clear any buffered data
+  i2s_zero_dma_buffer(I2S_NUM_1);
+
+  // Reinitialize I2S speaker settings (optional, but may help)
+  i2s_set_clk(I2S_NUM_1, SAMPLE_RATE, BITS_PER_SAMPLE, 
+              (CHANNELS == 1) ? I2S_CHANNEL_MONO : I2S_CHANNEL_STEREO);
+
+
+
 
     uint32_t startTime = millis();
     size_t bytesWritten = 0;
@@ -200,4 +224,6 @@ void loop() {
     vibrationDetected = false;  // Reset flag after printing
     delay(500); // Small pause
   }
+  digitalWrite(speakerPowerPin, LOW); // Set the pin high
+
 }
