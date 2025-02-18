@@ -32,6 +32,7 @@ const int switchPin = 5;
 const int vibrationPin = 4;  
 
 const int speakerPowerPin = 13;
+const int microphonePowerPin = 14;
 // Calculate total samples for RECORD_SECONDS at SAMPLE_RATE
 static const size_t TOTAL_SAMPLES = SAMPLE_RATE * RECORD_SECONDS;
 
@@ -112,8 +113,9 @@ void setup() {
   // Configure pins
   pinMode(switchPin, INPUT_PULLUP);
   pinMode(speakerPowerPin, OUTPUT); // Set the pin as an output
+  pinMode(microphonePowerPin, OUTPUT);
 
-  pinMode(vibrationPin, INPUT_PULLUP); // SW420 typically uses a simple digital pin
+  pinMode(vibrationPin, INPUT); 
   attachInterrupt(digitalPinToInterrupt(vibrationPin), vibrationISR, FALLING);  // Detect LOW signal
 
   // Allocate audio buffer dynamically (for 5 seconds of audio)
@@ -134,6 +136,7 @@ void setup() {
 void loop() {
   // 1. Check if the switch is pressed -> Start recording
   if (digitalRead(switchPin) == LOW) {
+    digitalWrite(microphonePowerPin, HIGH);
     Serial.println("Recording started...");
 
     size_t totalBytesToRead = TOTAL_SAMPLES * sizeof(int16_t);
@@ -145,6 +148,7 @@ void loop() {
     {
       // Check if the button has been released
       if (digitalRead(switchPin) == HIGH) {
+        digitalWrite(microphonePowerPin, LOW);
         Serial.println("Button released, stopping recording...");
         break; // Exit the loop immediately
       }
@@ -201,9 +205,6 @@ void loop() {
   // Reinitialize I2S speaker settings (optional, but may help)
   i2s_set_clk(I2S_NUM_1, SAMPLE_RATE, BITS_PER_SAMPLE, 
               (CHANNELS == 1) ? I2S_CHANNEL_MONO : I2S_CHANNEL_STEREO);
-
-
-
 
     uint32_t startTime = millis();
     size_t bytesWritten = 0;
