@@ -1,11 +1,13 @@
 /*
   ESP32 I2S Microphone Sample
   Record audio from I2S microphone and play it back
-  upon vibration trigger (SW420 sensor).
+  upon vibration trigger (SW420 sensor), saving and
+  loading from SPIFFS.
 */
 
 #include <Arduino.h>
 #include <driver/i2s.h>
+#include "SPIFFS.h"
 
 // -------------------- CONFIGURATIONS --------------------
 #define SAMPLE_RATE       10000          // Adjust as needed
@@ -31,21 +33,83 @@ const int switchPin = 5;
 // Vibration sensor pin (for playback)
 const int vibrationPin = 4;  
 
+// Additional pins
 const int speakerPowerPin = 13;
 const int microphonePowerPin = 14;
+
 // Calculate total samples for RECORD_SECONDS at SAMPLE_RATE
 static const size_t TOTAL_SAMPLES = SAMPLE_RATE * RECORD_SECONDS;
+// We'll use the same buffer size for loading from SPIFFS
+static const size_t MAX_AUDIO_BYTES = TOTAL_SAMPLES * sizeof(int16_t);
 
-// Dynamically allocated audio buffer for recording
+// Dynamically allocated audio buffer for both recording and playback
 int16_t* recordedData = nullptr;
 
 // Track how many bytes of valid audio are recorded
 size_t recordedSize = 0;  
 
-// -------------------- I2S SETUP --------------------
-volatile bool vibrationDetected = false; // Flag for vibration
+// Vibration ISR flag
+volatile bool vibrationDetected = false; 
 
-// Configure I2S for microphone (RX)
+// -------------------- FUNCTION PROTOTYPES --------------------
+void saveAudioToSPIFFS(const char* filename, int16_t* data, size_t sizeInBytes);
+bool loadAudioFromSPIFFS(const char* filename, int16_t* buffer, size_t maxBytes, size_t& actualBytesRead);
+
+// -------------------- I2S SETUP --------------------
+void setupI2SMic();
+void setupI2SSpeaker();
+void IRAM_ATTR vibrationISR();
+
+// -------------------- SPIFFS SAVE/LOAD --------------------
+
+// Write raw audio data to SPIFFS
+void saveAudioToSPIFFS(const char* filename, int16_t* data, size_t sizeInBytes) {
+  File file = SPIFFS.open(filename, FILE_WRITE);
+  if (!file) {
+    Serial.println("Error opening file for writing.");
+    return;
+  }
+  size_t written = file.write((uint8_t*)data, sizeInBytes);
+  file.close();
+
+  if (written == sizeInBytes) {
+    Serial.println("Audio successfully saved to SPIFFS.");
+  } else {
+    Serial.println("Failed to write all data to SPIFFS.");
+  }
+}
+
+// Read raw audio data from SPIFFS into buffer
+bool loadAudioFromSPIFFS(const char* filename, int16_t* buffer, size_t maxBytes, size_t &actualBytesRead) {
+  File file = SPIFFS.open(filename, FILE_READ);
+  if (!file) {
+    Serial.println("Failed to open file for reading.");
+    actualBytesRead = 0;
+    return false;
+  }
+
+  size_t fileSize = file.size();
+  if (fileSize > maxBytes) {
+    Serial.println("File is larger than buffer size!");
+    file.close();
+    actualBytesRead = 0;
+    return false;
+  }
+
+  // Read the entire file into the buffer
+  actualBytesRead = file.read((uint8_t*)buffer, fileSize);
+  file.close();
+
+  if (actualBytesRead == 0) {
+    Serial.println("No data read from file.");
+    return false;
+  }
+
+  Serial.printf("Loaded %u bytes from %s.\n", (unsigned)actualBytesRead, filename);
+  return true;
+}
+
+// -------------------- I2S SETUP FUNCTIONS --------------------
 void setupI2SMic() {
   i2s_config_t i2s_config_mic = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
@@ -74,7 +138,6 @@ void setupI2SMic() {
               (CHANNELS == 1) ? I2S_CHANNEL_MONO : I2S_CHANNEL_STEREO);
 }
 
-// Configure I2S for speaker (TX)
 void setupI2SSpeaker() {
   i2s_config_t i2s_config_speaker = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
@@ -102,24 +165,27 @@ void setupI2SSpeaker() {
   i2s_set_clk(I2S_NUM_1, SAMPLE_RATE, BITS_PER_SAMPLE, 
               (CHANNELS == 1) ? I2S_CHANNEL_MONO : I2S_CHANNEL_STEREO);
 }
+
+// Interrupt for vibration sensor
 void IRAM_ATTR vibrationISR() {
   vibrationDetected = true;  // Set flag when vibration occurs
 }
 
+// -------------------- SETUP --------------------
 void setup() {
   Serial.begin(115200);
   Serial.println("Initializing...");
 
   // Configure pins
   pinMode(switchPin, INPUT_PULLUP);
-  pinMode(speakerPowerPin, OUTPUT); // Set the pin as an output
+  pinMode(speakerPowerPin, OUTPUT);
   pinMode(microphonePowerPin, OUTPUT);
 
-  pinMode(vibrationPin, INPUT); 
-  attachInterrupt(digitalPinToInterrupt(vibrationPin), vibrationISR, FALLING);  // Detect LOW signal
+  pinMode(vibrationPin, INPUT);
+  attachInterrupt(digitalPinToInterrupt(vibrationPin), vibrationISR, FALLING);
 
-  // Allocate audio buffer dynamically (for 5 seconds of audio)
-  recordedData = (int16_t*)malloc(TOTAL_SAMPLES * sizeof(int16_t));
+  // Allocate audio buffer for up to 5 seconds of audio
+  recordedData = (int16_t*)malloc(MAX_AUDIO_BYTES);
   if (!recordedData) {
     Serial.println("Error: Failed to allocate memory for recordedData.");
     while (1) { /* halt */ }
@@ -129,17 +195,24 @@ void setup() {
   setupI2SMic();
   setupI2SSpeaker();
 
+  // Initialize SPIFFS
+  if (!SPIFFS.begin(true)) {
+    Serial.println("SPIFFS mount failed");
+    while (true) { /* halt */ }
+  }
+
   delay(500);
   Serial.println("Initialization Complete.");
 }
 
+// -------------------- MAIN LOOP --------------------
 void loop() {
   // 1. Check if the switch is pressed -> Start recording
   if (digitalRead(switchPin) == LOW) {
     digitalWrite(microphonePowerPin, HIGH);
     Serial.println("Recording started...");
 
-    size_t totalBytesToRead = TOTAL_SAMPLES * sizeof(int16_t);
+    size_t totalBytesToRead = MAX_AUDIO_BYTES; // 5s worth of 16-bit samples
     recordedSize = 0; // Reset recorded size
     uint32_t startTime = millis();
 
@@ -154,19 +227,19 @@ void loop() {
       }
 
       size_t bytesRead = 0;
-      // Read data from the microphone (non-blocking behavior)
+      // Read data from the microphone (with a short timeout)
       esp_err_t err = i2s_read(
         I2S_NUM_0,
         (char*)recordedData + recordedSize,
         totalBytesToRead - recordedSize,
         &bytesRead,
-        10 // Timeout for 10 ms to avoid long blocking
+        10 // 10 ms timeout to avoid long blocking
       );
 
       if (err == ESP_OK && bytesRead > 0) {
         recordedSize += bytesRead;
 
-        // Apply software gain to new samples only
+        // Apply software gain to the *newly* read samples
         size_t samplesRead = bytesRead / sizeof(int16_t);
         for (size_t i = 0; i < samplesRead; ++i) {
           int sampleIndex = (recordedSize / sizeof(int16_t)) - samplesRead + i;
@@ -182,49 +255,65 @@ void loop() {
     }
 
     Serial.println("Recording finished.");
-    delay(500); // Small pause
+    digitalWrite(microphonePowerPin, LOW);
+
+    // Save the recorded audio to SPIFFS
+    if (recordedSize > 0) {
+      saveAudioToSPIFFS("/audio_data.bin", recordedData, recordedSize);
+    }
+    delay(500);
   }
 
-
-
-  // 2. Check vibration sensor -> Playback
-  if (vibrationDetected && recordedSize > 0) {
+  // 2. Check vibration sensor -> Playback from SPIFFS
+  if (vibrationDetected) {
     Serial.println("Vibration detected, starting playback...");
+
+    // Load audio from SPIFFS into recordedData
+    size_t fileBytesRead = 0;
+    bool loaded = loadAudioFromSPIFFS("/audio_data.bin",
+                                      recordedData,
+                                      MAX_AUDIO_BYTES,
+                                      fileBytesRead);
+    vibrationDetected = false;  // reset flag
+
+    if (!loaded || fileBytesRead == 0) {
+      Serial.println("No valid audio file to play.");
+      return;
+    }
+
     // Turn on speaker module
-    digitalWrite(speakerPowerPin, HIGH); // Set the pin high
+    digitalWrite(speakerPowerPin, HIGH);
     delay(100);
 
-  // Ensure previous I2S driver is stopped and reset
-  i2s_driver_uninstall(I2S_NUM_1);
-  delay(50);
-  setupI2SSpeaker(); // Reinitialize I2S for speaker
+    // Re-init I2S speaker
+    i2s_driver_uninstall(I2S_NUM_1);
+    delay(50);
+    setupI2SSpeaker();
 
-  // Flush I2S to clear any buffered data
-  i2s_zero_dma_buffer(I2S_NUM_1);
-
-  // Reinitialize I2S speaker settings (optional, but may help)
-  i2s_set_clk(I2S_NUM_1, SAMPLE_RATE, BITS_PER_SAMPLE, 
-              (CHANNELS == 1) ? I2S_CHANNEL_MONO : I2S_CHANNEL_STEREO);
+    // Clear I2S buffers
+    i2s_zero_dma_buffer(I2S_NUM_1);
+    i2s_set_clk(I2S_NUM_1, SAMPLE_RATE, BITS_PER_SAMPLE, 
+                (CHANNELS == 1) ? I2S_CHANNEL_MONO : I2S_CHANNEL_STEREO);
 
     uint32_t startTime = millis();
-    size_t bytesWritten = 0;
 
-    while ((millis() - startTime) < (PLAYBACK_SECONDS * 1000) &&
-           digitalRead(vibrationPin) == HIGH)
+    while ((millis() - startTime) < (PLAYBACK_SECONDS * 1000))
     {
+      size_t bytesWritten = 0;
+      // Write the entire buffer to I2S
       i2s_write(
         I2S_NUM_1,
         (const char*)recordedData,
-        recordedSize,
+        fileBytesRead,
         &bytesWritten,
         portMAX_DELAY
       );
+      // If you only want to play once, break
+      break;
     }
 
-    Serial.println("Playback finished or vibration stopped. Waiting...");
-    vibrationDetected = false;  // Reset flag after printing
-    delay(500); // Small pause
+    Serial.println("Playback finished. Waiting...");
+    digitalWrite(speakerPowerPin, LOW);
+    delay(500); 
   }
-  digitalWrite(speakerPowerPin, LOW); // Set the pin high
-
 }
